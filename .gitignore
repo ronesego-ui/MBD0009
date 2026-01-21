@@ -1,0 +1,11 @@
+# Excluir archivos no solicitados
+Pregunta1_FV.py
+Problem Set 01.pdf
+data/resultados_scraping.csv
+
+# Excluir archivos de sistema y temporales
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.ipynb_checkpoints/

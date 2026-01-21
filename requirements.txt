@@ -1,0 +1,15 @@
+# Dependencias para Problem Set 01
+# Instalar con: pip install -r requirements.txt
+
+# Análisis de datos y manipulación
+pandas>=1.5.0
+numpy>=1.21.0
+
+# Machine Learning y modelado
+scikit-learn>=1.0.0
+
+# Modelo Gamma-Gamma para CLTV (opcional)
+lifetimes>=0.11.0
+
+# Utilidades
+warnings

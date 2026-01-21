@@ -1,4 +1,4 @@
-# Problem Set 01 - MBD0008
+# Problem Set 01 - MBD0009
 
 ## Descripción General
 
@@ -29,12 +29,6 @@ Tarea01/
 
 ---
 
-## Instalación y Ejecución
-
-### Requisitos Previos
-
-- Python 3.8 o superior
-- pip (gestor de paquetes de Python)
 
 ### Instalación de Dependencias
 

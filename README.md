@@ -174,9 +174,9 @@ Estimación del efecto causal de la publicidad en las ventas.
 ## Autor
 
 Grupo 2 - MBD0009
-Daniel Avello
-Felipe Valdivia
-Roberto Sepulveda
+- Daniel Avello
+- Felipe Valdivia
+- Roberto Sepulveda
 
 ---
 "MBD0009" 

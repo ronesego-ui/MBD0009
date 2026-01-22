@@ -33,7 +33,12 @@ Tarea01/
 ### Instalación de Dependencias
 
 ```bash
-pip install -r requirements.txt
+Librerias
+    pip install pandas numpy rapidfuzz playwright beautifulsoup4 scikit-learn
+    pip install -r requirements.txt
+
+Motor del navegador para la automatización (pregunta 2)
+    playwright install chromium
 ```
 
 ### Ejecución
@@ -174,4 +179,4 @@ Felipe Valdivia
 Roberto Sepulveda
 
 ---
-"# MBD0009" 
+"MBD0009" 

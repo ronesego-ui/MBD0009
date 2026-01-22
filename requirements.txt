@@ -17,9 +17,3 @@ beautifulsoup4>=4.12,<5
 
 # Procesamiento de texto y Fuzzy Matching
 rapidfuzz>=3.0.0
-
-# Dependencias de bajo nivel
-greenlet>=3.2.3
-
-# Utilidades
-warnings

@@ -1,361 +1,746 @@
+# -*- coding: utf-8 -*-
+
+# Instalar librerias pendientes
+#pip install rapidfuzz
+
+#librerias
 import pandas as pd
 import numpy as np
+import re
+import unicodedata
+from rapidfuzz import process, fuzz
 
-# -----------------------------------------------------------------------------
-# Carga de datos
-# Los archivos contienen informacion de productos, inventario y transacciones
-# -----------------------------------------------------------------------------
-print("=" * 70)
-print("PARTE 1: RETAIL ANALYTICS")
-print("=" * 70)
+#Cargar archivos
+#inv = pd.read_csv('C:/Users/felip/Desktop/Magíster/8. Marketing y Analítica del Retail/Tarea 1/inventario_diario.csv')
+#prod = pd.read_csv('C:/Users/felip/Desktop/Magíster/8. Marketing y Analítica del Retail/Tarea 1/maestro_productos.csv')
+#trx = pd.read_csv('C:/Users/felip/Desktop/Magíster/8. Marketing y Analítica del Retail/Tarea 1/transacciones_ventas.csv')
 
-# Cargamos los tres archivos necesarios
-maestro_productos = pd.read_csv("data/maestro_productos.csv")
-inventario_diario = pd.read_csv("data/inventario_diario.csv")
-transacciones = pd.read_csv("data/transacciones_ventas.csv")
+inv = pd.read_csv("data/inventario_diario.csv")
+prod = pd.read_csv("data/maestro_productos.csv")
+trx = pd.read_csv("data/transacciones_ventas.csv")
 
-# Convertimos las columnas numericas (pueden venir como texto en algunos CSVs)
-columnas_numericas_trans = ['unidades_vendidas', 'precio_unitario_venta', 'costo_unitario', 
-                            'precio_lista_original', 'monto_descuento_unitario']
-for col in columnas_numericas_trans:
-    if col in transacciones.columns:
-        transacciones[col] = pd.to_numeric(transacciones[col], errors='coerce')
 
-columnas_numericas_inv = ['cantidad_stock', 'valor_inventario_costo']
-for col in columnas_numericas_inv:
-    if col in inventario_diario.columns:
-        inventario_diario[col] = pd.to_numeric(inventario_diario[col], errors='coerce')
+#Funciones de limpieza, normalización y relleno de datos
+#_________________________________________________________________________
 
-# Eliminamos filas con valores nulos en columnas criticas
-transacciones = transacciones.dropna(subset=['unidades_vendidas', 'precio_unitario_venta', 'costo_unitario'])
-inventario_diario = inventario_diario.dropna(subset=['valor_inventario_costo'])
+##################### Limpieza de columna fecha ###########################
+def limpiar_fecha(df, col_fecha):
+    df = df.copy()
 
-print("\n[DATOS] Productos cargados:")
-print(f"   - Total de productos unicos: {maestro_productos['product_id'].nunique()}")
-print(f"   - Categorias disponibles: {maestro_productos['categoria'].unique().tolist()}")
+    # 1. Eliminar letras y caracteres raros
+    df[col_fecha] = (
+        df[col_fecha]
+        .astype(str)
+        .str.replace(r"[a-zA-Z]", "", regex=True)
+        .str.replace(r"[^0-9\-\/]", "", regex=True)
+        .replace("", pd.NA)
+    )
 
-# -----------------------------------------------------------------------------
-# PREGUNTA 1. Cálculo de KPIs.
-# -----------------------------------------------------------------------------
-# PREGUNTA 1.1: Cero Censurado (Out-Of-Stock) y Sustituciones de SKUs
-# Analisis de como estos fenomenos afectan la integridad de los datos historicos
-# -----------------------------------------------------------------------------
-print("\n" + "=" * 70)
-print("PREGUNTA 1.1: CERO CENSURADO (OUT-OF-STOCK) Y SUSTITUCIONES DE SKUs")
-print("=" * 70)
+    # Intento 1: dd-mm-aaaa
+    fecha_1 = pd.to_datetime(
+        df[col_fecha],
+        errors="coerce",
+        dayfirst=True
+    )
 
-print("""
-[ANALISIS] IMPACTO EN LA INTEGRIDAD DE LOS ANALISIS HISTORICOS
-----------------------------------------------------------------------
+    # Intento 2: aaaa-mm-dd
+    fecha_2 = pd.to_datetime(
+        df[col_fecha],
+        errors="coerce",
+        yearfirst=True
+    )
 
-Los fenomenos de Cero Censurado (Out-Of-Stock) y Sustituciones de SKUs
-representan serios desafios para la calidad de los analisis historicos
-en retail. A continuacion se explica cada uno:
+    # Combinar intentos
+    fechas = fecha_1.combine_first(fecha_2)
 
-1. CERO CENSURADO (OUT-OF-STOCK / QUIEBRE DE STOCK)
-   -----------------------------------------------
-   
-   DEFINICION: Ocurre cuando un producto no esta disponible para la venta
-   debido a falta de inventario. Durante este periodo, las ventas registradas
-   son CERO, pero esto NO refleja la demanda real del producto.
-   
-   IMPACTO EN LOS ANALISIS:
-   
-   * SUBESTIMACION DE DEMANDA: Los modelos de pronostico aprenden de datos
-     historicos. Si hay periodos con ventas = 0 por quiebre, el modelo
-     subestimara la demanda real del producto.
-   
-   * SESGO EN METRICAS DE ROTACION: El GMROI y otras metricas de eficiencia
-     se calculan con ventas historicas. Los quiebres distorsionan estas
-     metricas haciendolas parecer peores de lo que realmente son.
-   
-   * PERDIDA DE VENTAS NO CONTABILIZADA: La venta perdida durante el quiebre
-     no se registra en ningun lugar, generando una "demanda invisible".
-   
-   * ESTACIONALIDAD DISTORSIONADA: Si un quiebre coincide con un pico de
-     demanda (ej: Navidad), los patrones estacionales quedan mal calibrados.
+    # Casos donde solo viene el año (yyyy)
+    solo_anio = df[col_fecha].astype(str).str.fullmatch(r"\d{4}")
+    fechas.loc[solo_anio] = pd.to_datetime(
+        df.loc[solo_anio, col_fecha] + "-01-01",
+        errors="coerce"
+    )
 
-2. SUSTITUCIONES DE SKUs
-   ----------------------
-   
-   DEFINICION: Cuando un cliente no encuentra el producto deseado, puede
-   comprar un sustituto similar. Esto infla las ventas del sustituto y
-   oculta la demanda real de ambos productos.
-   
-   IMPACTO EN LOS ANALISIS:
-   
-   * INFLACION ARTIFICIAL: El producto sustituto muestra ventas mas altas
-     de lo que tendria en condiciones normales, llevando a sobrestock futuro.
-   
-   * CORRELACION ESPURIA: Se crean correlaciones falsas entre productos que
-     en realidad son sustitutos, no complementarios.
-   
-   * CANIBALIZACION OCULTA: Es dificil distinguir si las ventas altas de un
-     producto son por demanda genuina o por sustitucion forzada.
-   
-   * ERRORES EN PREDICCION: Los modelos ML pueden aprender patrones incorrectos
-     basados en sustituciones temporales, no en preferencias reales.
+    # 3. Forzar todos los años a 2025
+    fechas.loc[fechas.notna()] = fechas.loc[fechas.notna()].apply(
+        lambda x: x.replace(year=2025)
+    )
 
-----------------------------------------------------------------------
-MEDIDAS DE INGENIERIA DE DATOS RECOMENDADAS
-----------------------------------------------------------------------
+    # 4. Rellenar fechas vacías con la inmediatamente anterior
+    fechas = fechas.ffill()
 
-1. DETECCION Y MARCADO DE QUIEBRES DE STOCK
-   
-   * Crear una variable indicadora 'flag_oos' (Out-Of-Stock) que identifique
-     dias donde el inventario fue cero o cercano a cero.
-   * Unir transacciones con inventario diario para detectar periodos sin stock.
-   * Marcar estos registros para excluirlos o tratarlos especialmente en
-     modelos de pronostico.
+    # Formato final
+    df[col_fecha] = fechas.dt.strftime("%d-%m-%Y")
 
-2. ESTIMACION DE DEMANDA CENSURADA
-   
-   * Usar modelos de demanda censurada (Tobit) que ajustan por la truncacion.
-   * Implementar tecnicas de imputacion basadas en periodos similares con stock.
-   * Calcular "demanda no satisfecha" usando tasas de conversion historicas.
+    return df
 
-3. DETECCION DE SUSTITUCIONES
-   
-   * Analizar picos inusuales en productos cuando otros relacionados estan OOS.
-   * Crear matrices de sustitucion basadas en elasticidad cruzada de precios.
-   * Implementar reglas de negocio para identificar pares de productos
-     sustitutos (misma categoria, precio similar, marca similar).
 
-4. LIMPIEZA Y AJUSTE DE DATOS
-   
-   * Separar periodos "limpios" de periodos "contaminados" para entrenar modelos.
-   * Crear features adicionales: 'dias_desde_ultimo_quiebre', 'productos_oos_categoria'.
-   * Implementar pipelines de calidad de datos que reporten anomalias.
+##################### Limpieza de columna categoria #########################
 
-5. MONITOREO Y ALERTAS
-   
-   * Dashboards de salud de inventario que alerten sobre quiebres frecuentes.
-   * KPIs de "tasa de disponibilidad" por categoria y producto.
-   * Reportes de productos con patron sospechoso de sustitucion.
-""")
+#------- Normalización -------#
 
-# Analisis practico: Detectamos posibles quiebres de stock en los datos
-print("[INFO] Deteccion de posibles quiebres de stock en los datos:")
-print("-" * 70)
+def normalizar_categoria(df, col_categoria):
+    df = df.copy()
 
-# Buscamos productos con inventario = 0
-productos_sin_stock = inventario_diario[inventario_diario['cantidad_stock'] == 0]
-if len(productos_sin_stock) > 0:
-    productos_afectados = productos_sin_stock['product_id'].nunique()
-    dias_afectados = productos_sin_stock['fecha'].nunique() if 'fecha' in productos_sin_stock.columns else "N/A"
-    print(f"   - Registros con stock = 0 detectados: {len(productos_sin_stock):,}")
-    print(f"   - Productos unicos afectados: {productos_afectados:,}")
-    print(f"   - Dias con al menos un quiebre: {dias_afectados}")
-else:
-    print("   - No se detectaron registros con stock = 0 en los datos.")
+    def _normalizar(x):
+        if pd.isna(x):
+            return x
 
-# -----------------------------------------------------------------------------
-# PREGUNTA 1.2: Calculo de GMROI por Categoria
-# GMROI = Margen Bruto / Inventario Promedio a Costo
-# Esta metrica nos indica cuantos pesos de margen genera cada peso invertido
-# en inventario
-# -----------------------------------------------------------------------------
-print("\n" + "=" * 70)
-print("PREGUNTA 1.2: GMROI (Gross Margin Return on Investment)")
-print("=" * 70)
+        x = str(x)
 
-# Calculamos las metricas de ventas necesarias
-# Ingreso total = unidades vendidas x precio de venta
-transacciones['ingreso_total'] = (
-    transacciones['unidades_vendidas'] * transacciones['precio_unitario_venta']
-)
+        # Corregir encoding roto (MÃ³ → ó)
+        try:
+            x = x.encode("latin1").decode("utf-8")
+        except Exception:
+            pass
 
-# Costo total = unidades vendidas x costo unitario
-transacciones['costo_total'] = (
-    transacciones['unidades_vendidas'] * transacciones['costo_unitario']
-)
+        # Minúsculas
+        x = x.lower()
 
-# Margen bruto = Ingreso - Costo
-transacciones['margen_bruto'] = (
-    transacciones['ingreso_total'] - transacciones['costo_total']
-)
+        # Quitar tildes
+        x = unicodedata.normalize("NFKD", x)
+        x = "".join(c for c in x if not unicodedata.combining(c))
 
-# Agrupamos las ventas por categoria para obtener totales
-ventas_por_categoria = transacciones.groupby('categoria').agg({
-    'ingreso_total': 'sum',
-    'costo_total': 'sum',
-    'margen_bruto': 'sum'
-}).reset_index()
+        # Eliminar caracteres no alfabéticos
+        x = re.sub(r"[^a-z\s]", "", x)
 
-# Calculamos el inventario promedio a costo por categoria
-# Esto representa la inversion promedio en stock
-inventario_promedio = inventario_diario.groupby('categoria').agg({
-    'valor_inventario_costo': 'mean'
-}).reset_index()
-inventario_promedio.columns = ['categoria', 'inventario_promedio_costo']
+        # Normalizar espacios
+        x = re.sub(r"\s+", " ", x).strip()
 
-# Combinamos los datos para calcular el GMROI
-analisis_gmroi = pd.merge(
-    ventas_por_categoria, 
-    inventario_promedio, 
-    on='categoria'
-)
+        return x
 
-# GMROI = Margen Bruto Total / Inventario Promedio a Costo
-analisis_gmroi['gmroi'] = (
-    analisis_gmroi['margen_bruto'] / analisis_gmroi['inventario_promedio_costo']
-)
+    df[col_categoria] = df[col_categoria].apply(_normalizar)
 
-# Calculamos tambien el porcentaje de margen bruto para el analisis
-analisis_gmroi['margen_bruto_pct'] = (
-    analisis_gmroi['margen_bruto'] / analisis_gmroi['ingreso_total'] * 100
-)
+    return df
 
-print("\n[RESULTADOS] GMROI por Categoria:")
-print("-" * 70)
-gmroi_display = analisis_gmroi[['categoria', 'margen_bruto', 'inventario_promedio_costo', 'gmroi', 'margen_bruto_pct']].copy()
-gmroi_display.columns = ['Categoria', 'Margen Bruto ($)', 'Inv. Promedio ($)', 'GMROI', 'Margen (%)']
-gmroi_display = gmroi_display.sort_values('GMROI', ascending=False)
-print(gmroi_display.to_string(index=False))
+#------- Diccionario palabras correctas -------#
 
-# -----------------------------------------------------------------------------
-# Respuesta a la pregunta: Por que un producto con margen porcentual bajo
-# puede tener un GMROI superior a uno de margen alto?
-# -----------------------------------------------------------------------------
-print("\n" + "-" * 70)
-print("[ANALISIS] Por que un producto con margen bajo puede tener GMROI alto?")
-print("-" * 70)
-print("""
-La respuesta se encuentra en la rotacion del inventario. El GMROI combina dos
-factores fundamentales:
-
-   GMROI = Margen Bruto % x Rotacion de Inventario
-
-Un producto con margen porcentual bajo puede generar mas retorno si:
-
-   1. ALTA ROTACION: Si el producto se vende rapidamente, el inventario
-      promedio es bajo, lo que aumenta el denominador del GMROI.
-      
-   2. MENOR CAPITAL INMOVILIZADO: Al venderse mas rapido, se libera capital
-      para reinvertir, generando mas ciclos de ganancia en el mismo periodo.
-      
-   3. EFECTO VOLUMEN: Un margen pequeno multiplicado muchas veces supera
-      a un margen alto que se concreta pocas veces.
-
-Ejemplo practico:
-   - Producto A: Margen 50%, rota 2 veces/ano -> GMROI = 1.0
-   - Producto B: Margen 10%, rota 15 veces/ano -> GMROI = 1.5
-
-Conclusion: La velocidad a la que convertimos inventario en ventas es tan
-importante como el margen que obtenemos en cada venta.
-""")
-
-# -----------------------------------------------------------------------------
-# PREGUNTA 1.3: Calculo del Porcentaje de Markdown
-# Markdown = Descuento aplicado sobre el precio original
-# -----------------------------------------------------------------------------
-print("\n" + "=" * 70)
-print("PREGUNTA 1.3: PORCENTAJE DE MARKDOWN POR CATEGORIA")
-print("=" * 70)
-
-# Calculamos el markdown (descuento) como porcentaje del precio original
-transacciones['markdown_pct'] = (
-    transacciones['monto_descuento_unitario'] / 
-    transacciones['precio_lista_original'] * 100
-)
-
-# Ponderamos el markdown por las unidades vendidas para obtener un promedio
-# mas representativo (productos que se venden mas tienen mas peso)
-transacciones['markdown_ponderado'] = (
-    transacciones['markdown_pct'] * transacciones['unidades_vendidas']
-)
-
-markdown_por_categoria = transacciones.groupby('categoria').agg({
-    'markdown_ponderado': 'sum',
-    'unidades_vendidas': 'sum'
-}).reset_index()
-
-markdown_por_categoria['markdown_promedio_pct'] = (
-    markdown_por_categoria['markdown_ponderado'] / 
-    markdown_por_categoria['unidades_vendidas']
-)
-
-print("\n[RESULTADOS] Porcentaje de Markdown por Categoria:")
-print("-" * 70)
-markdown_display = markdown_por_categoria[['categoria', 'markdown_promedio_pct']].copy()
-markdown_display.columns = ['Categoria', 'Markdown Promedio (%)']
-markdown_display = markdown_display.sort_values('Markdown Promedio (%)', ascending=False)
-print(markdown_display.to_string(index=False))
-
-# -----------------------------------------------------------------------------
-# Combinamos GMROI con Markdown para analisis integral
-# -----------------------------------------------------------------------------
-analisis_completo = pd.merge(
-    analisis_gmroi[['categoria', 'gmroi', 'margen_bruto_pct']], 
-    markdown_por_categoria[['categoria', 'markdown_promedio_pct']], 
-    on='categoria'
-)
-
-# Identificamos categorias con GMROI alto pero Markdown > 20%
-print("\n" + "-" * 70)
-print("[ALERTA] ANALISIS: Categorias con GMROI alto pero Markdown > 20%")
-print("-" * 70)
-
-categorias_riesgo = analisis_completo[
-    (analisis_completo['gmroi'] > analisis_completo['gmroi'].median()) & 
-    (analisis_completo['markdown_promedio_pct'] > 20)
+categorias_reales = [
+    "despensa",
+    "hogar",
+    "lenceria",
+    "pequenos electrodomesticos",
+    "carnes",
+    "cuidado del bebe",
+    "viaje",
+    "bebidas",
+    "ropa nino",
+    "higiene personal",
+    "salud",
+    "relojeria",
+    "electronica",
+    "panaderia",
+    "automotriz",
+    "informatica",
+    "ropa mujer",
+    "jardin",
+    "pescados",
+    "mascotas",
+    "camping",
+    "papeleria",
+    "belleza",
+    "limpieza",
+    "bisuteria",
+    "lacteos",
+    "congelados",
+    "television y audio",
+    "muebles",
+    "iluminacion",
+    "juguetes",
+    "ropa hombre",
+    "alimentos",
+    "farmacia",
+    "decoracion",
+    "frutas y verduras",
+    "calzado",
+    "ferreteria",
+    "deportes",
+    "accesorios moviles",
+    "moda"
 ]
 
-if len(categorias_riesgo) > 0:
-    print("\nCategorias identificadas:")
-    for _, row in categorias_riesgo.iterrows():
-        print(f"   - {row['categoria']}: GMROI={row['gmroi']:.2f}, Markdown={row['markdown_promedio_pct']:.1f}%")
-else:
-    print("\n   No se encontraron categorias que cumplan ambos criterios.")
-    print("   Mostrando categorias con mayor markdown para analisis:")
-    top_markdown = analisis_completo.nlargest(3, 'markdown_promedio_pct')
-    for _, row in top_markdown.iterrows():
-        print(f"   - {row['categoria']}: GMROI={row['gmroi']:.2f}, Markdown={row['markdown_promedio_pct']:.1f}%")
+# ----- Match por similitud ----- #
 
-print("\n[ANALISIS] PROBLEMAS QUE PODRIA ESTAR OCULTANDO UN GMROI ALTO CON MARKDOWN > 20%:")
-print("-" * 70)
-print("""
-Cuando observamos un GMROI aparentemente saludable junto con un markdown
-excesivo (mayor al 20%), debemos investigar posibles problemas subyacentes:
+def match_categoria_con_reales(
+    df,
+    col_categoria,
+    categorias_reales,
+    threshold=80
+):
+    """
+    Asigna cada categoría a la mejor coincidencia dentro de categorias_reales
+    usando fuzzy matching.
 
-   1. SOBRESTOCK Y COMPRAS EXCESIVAS
-      Los altos descuentos podrian indicar que se compro mas mercaderia de la
-      necesaria y ahora se esta liquidando para liberar capital. El GMROI puede
-      verse bien temporalmente por la alta rotacion forzada.
+    Parámetros
+    ----------
+    df : pd.DataFrame
+        DataFrame de entrada
+    col_categoria : str
+        Nombre de la columna de categorías
+    categorias_reales : list
+        Lista de categorías válidas (normalizadas)
+    threshold : int
+        Umbral mínimo de similitud (0–100)
 
-   2. PROBLEMAS DE PRONOSTICO DE DEMANDA
-      Un markdown elevado sugiere que los precios originales no reflejan
-      correctamente la disposicion a pagar del cliente, lo que indica fallas
-      en el pricing inicial o errores en la prediccion de demanda.
+    Retorna
+    -------
+    pd.DataFrame
+        DataFrame con la categoría corregida
+    """
 
-   3. COMPETENCIA AGRESIVA EN PRECIOS
-      El mercado podria estar forzando reducciones de precio para mantener
-      competitividad. Aunque las ventas se mantienen, los margenes reales
-      estan erosionandose.
+    df = df.copy()
 
-   4. DETERIORO O OBSOLESCENCIA
-      Productos cercanos a vencimiento o que se estan volviendo obsoletos
-      requieren descuentos agresivos para venderse, ocultando problemas
-      de gestion de inventario.
+    def _match(x):
+        if pd.isna(x):
+            return x
 
-   5. INFLACION DE GMROI TEMPORAL
-      Un markdown alto puede inflar artificialmente el GMROI a corto plazo
-      (mas ventas = menos inventario promedio), pero esto no es sostenible
-      y erosiona la rentabilidad real del negocio.
+        match = process.extractOne(
+            x,
+            categorias_reales,
+            scorer=fuzz.token_sort_ratio
+        )
 
-RECOMENDACION: Analizar la tendencia historica del markdown y correlacionarla
-con los niveles de inventario inicial de cada temporada para identificar
-si existe un patron de sobrecompra sistematica.
-""")
+        if match and match[1] >= threshold:
+            return match[0]
 
-# -----------------------------------------------------------------------------
-# Tabla resumen final
-# -----------------------------------------------------------------------------
-print("\n" + "=" * 70)
-print("[RESUMEN] EJECUTIVO - ANALISIS RETAIL")
-print("=" * 70)
-resumen = analisis_completo.copy()
-resumen.columns = ['Categoria', 'GMROI', 'Margen Bruto (%)', 'Markdown (%)']
-resumen = resumen.sort_values('GMROI', ascending=False)
-print(resumen.round(2).to_string(index=False))
-print("\n" + "=" * 70)
+        return x  # si no alcanza el umbral, no se reemplaza
+
+    df[col_categoria] = df[col_categoria].apply(_match)
+
+    return df
+
+
+
+
+################ Limpieza de columna precios y cantidad ####################
+
+def limpiar_col_num(df, col):
+    """
+    Elimina símbolos $ y -, limpia separadores y convierte la columna a numérica.
+
+    Parámetros
+    ----------
+    df : pd.DataFrame
+        DataFrame de entrada
+    col : str
+        Nombre de la columna a limpiar
+
+    Retorna
+    -------
+    pd.DataFrame
+        DataFrame con la columna convertida a numérica
+    """
+
+    df = df.copy()
+
+    def _limpiar(x):
+        if pd.isna(x):
+            return x
+
+        x = str(x)
+
+        # Eliminar símbolos $ y -
+        x = re.sub(r"[\$-]", "", x)
+
+        # Eliminar espacios
+        x = x.strip()
+
+        return x
+
+    df[col] = df[col].apply(_limpiar)
+
+    # Convertir a numérico (valores no convertibles → NaN)
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+
+################ Completar tablas con categorías faltantes ####################
+
+import pandas as pd
+
+def construir_prod_completo(
+    prod,
+    inv,
+    trx,
+    col_id="product_id",
+    col_categoria="categoria",
+    col_costo="costo_unitario",
+    col_precio_prod="precio_lista",
+    col_precio_trx="precio_lista_original"
+):
+    """
+    Construye una tabla prod completa usando prod, inv y trx
+    siguiendo reglas de prioridad y sin sobrescribir valores existentes.
+    """
+
+    # -------------------------------------------------
+    # 1. Copia inicial de prod
+    prod_nuevo = prod.copy()
+
+    # -------------------------------------------------
+    # 2. Incorporar product_id faltantes desde inv
+    inv_ids = inv[col_id].dropna().unique()
+    prod_ids = prod_nuevo[col_id].dropna().unique()
+
+    nuevos_inv = inv.loc[
+        inv[col_id].isin(set(inv_ids) - set(prod_ids)),
+        [col_id, col_categoria]
+    ].drop_duplicates(subset=[col_id])
+
+    prod_nuevo = pd.concat([prod_nuevo, nuevos_inv], ignore_index=True)
+
+    # -------------------------------------------------
+    # 3. Incorporar product_id faltantes desde trx
+    prod_ids = prod_nuevo[col_id].dropna().unique()
+
+    nuevos_trx = trx.loc[
+        trx[col_id].isin(set(trx[col_id].dropna()) - set(prod_ids)),
+        [col_id, col_categoria]
+    ].drop_duplicates(subset=[col_id])
+
+    prod_nuevo = pd.concat([prod_nuevo, nuevos_trx], ignore_index=True)
+
+    # -------------------------------------------------
+    # 4. Completar categoría (prioridad: inv → trx)
+    mapa_cat_inv = (
+        inv[[col_id, col_categoria]]
+        .dropna()
+        .drop_duplicates(subset=[col_id])
+        .set_index(col_id)[col_categoria]
+        .to_dict()
+    )
+
+    mapa_cat_trx = (
+        trx[[col_id, col_categoria]]
+        .dropna()
+        .drop_duplicates(subset=[col_id])
+        .set_index(col_id)[col_categoria]
+        .to_dict()
+    )
+
+    mask_cat = prod_nuevo[col_categoria].isna() & prod_nuevo[col_id].notna()
+
+    prod_nuevo.loc[mask_cat, col_categoria] = (
+        prod_nuevo.loc[mask_cat, col_id]
+        .map(mapa_cat_inv)
+        .fillna(prod_nuevo.loc[mask_cat, col_id].map(mapa_cat_trx))
+    )
+
+    # -------------------------------------------------
+    # 5. Completar costo_unitario desde trx
+    mapa_costo = (
+        trx[[col_id, col_costo]]
+        .dropna()
+        .drop_duplicates(subset=[col_id])
+        .set_index(col_id)[col_costo]
+        .to_dict()
+    )
+
+    mask_costo = prod_nuevo[col_costo].isna() & prod_nuevo[col_id].notna()
+
+    prod_nuevo.loc[mask_costo, col_costo] = (
+        prod_nuevo.loc[mask_costo, col_id].map(mapa_costo)
+    )
+
+    # -------------------------------------------------
+    # 6. Completar precio_lista desde trx
+    mapa_precio = (
+        trx[[col_id, col_precio_trx]]
+        .dropna()
+        .drop_duplicates(subset=[col_id])
+        .set_index(col_id)[col_precio_trx]
+        .to_dict()
+    )
+
+    mask_precio = prod_nuevo[col_precio_prod].isna() & prod_nuevo[col_id].notna()
+
+    prod_nuevo.loc[mask_precio, col_precio_prod] = (
+        prod_nuevo.loc[mask_precio, col_id].map(mapa_precio)
+    )
+
+    return prod_nuevo
+
+
+
+
+############# Completar tabla transacciones #################
+
+def completar_trx_desde_prod(
+    trx,
+    prod,
+    col_product_id="product_id"
+):
+    """
+    Completa campos faltantes en trx usando la tabla maestra prod
+    y luego imputa unidades_vendidas por mediana por categoria.
+    """
+
+    trx = trx.copy()
+    prod = prod.copy()
+
+    # ---------------------------------
+    # Diccionarios desde prod
+    # ---------------------------------
+    mapa_categoria = (
+        prod[[col_product_id, "categoria"]]
+        .dropna(subset=[col_product_id, "categoria"])
+        .drop_duplicates(col_product_id)
+        .set_index(col_product_id)["categoria"]
+        .to_dict()
+    )
+
+    mapa_precio_lista = (
+        prod[[col_product_id, "precio_lista"]]
+        .dropna(subset=[col_product_id, "precio_lista"])
+        .drop_duplicates(col_product_id)
+        .set_index(col_product_id)["precio_lista"]
+        .to_dict()
+    )
+
+    mapa_costo = (
+        prod[[col_product_id, "costo_unitario"]]
+        .dropna(subset=[col_product_id, "costo_unitario"])
+        .drop_duplicates(col_product_id)
+        .set_index(col_product_id)["costo_unitario"]
+        .to_dict()
+    )
+
+    # ---------------------------------
+    # 1. Categoria
+    # ---------------------------------
+    mask = trx["categoria"].isna() & trx[col_product_id].notna()
+    trx.loc[mask, "categoria"] = trx.loc[mask, col_product_id].map(mapa_categoria)
+
+    # ---------------------------------
+    # 2. Precio lista original
+    # ---------------------------------
+    mask = trx["precio_lista_original"].isna() & trx[col_product_id].notna()
+    trx.loc[mask, "precio_lista_original"] = (
+        trx.loc[mask, col_product_id].map(mapa_precio_lista)
+    )
+
+    # ---------------------------------
+    # 3. Costo unitario
+    # ---------------------------------
+    mask = trx["costo_unitario"].isna() & trx[col_product_id].notna()
+    trx.loc[mask, "costo_unitario"] = (
+        trx.loc[mask, col_product_id].map(mapa_costo)
+    )
+
+    # ---------------------------------
+    # 4. Precio unitario venta
+    # precio_lista_original - monto_descuento_unitario
+    # ---------------------------------
+    mask = (
+        trx["precio_unitario_venta"].isna() &
+        trx["precio_lista_original"].notna() &
+        trx["monto_descuento_unitario"].notna()
+    )
+
+    trx.loc[mask, "precio_unitario_venta"] = (
+        trx.loc[mask, "precio_lista_original"]
+        - trx.loc[mask, "monto_descuento_unitario"]
+    )
+
+    # ---------------------------------
+    # 5. Monto descuento unitario
+    # precio_lista_original - precio_unitario_venta
+    # ---------------------------------
+    mask = (
+        trx["monto_descuento_unitario"].isna() &
+        trx["precio_lista_original"].notna() &
+        trx["precio_unitario_venta"].notna()
+    )
+
+    trx.loc[mask, "monto_descuento_unitario"] = (
+        trx.loc[mask, "precio_lista_original"]
+        - trx.loc[mask, "precio_unitario_venta"]
+    )
+
+    # =========================================================
+    # 6. IMPUTACIÓN: unidades_vendidas por mediana de categoria
+    # =========================================================
+
+    # Mediana por categoria (solo valores válidos)
+    mediana_por_categoria = (
+        trx.groupby("categoria")["unidades_vendidas"]
+        .median()
+        .round()
+        .astype("Int64")
+    )
+
+    mask = trx["unidades_vendidas"].isna() & trx["categoria"].notna()
+
+    trx.loc[mask, "unidades_vendidas"] = (
+        trx.loc[mask, "categoria"]
+        .map(mediana_por_categoria)
+    )
+
+    return trx
+
+
+############# Completar tabla inventario #################
+
+def completar_inv_desde_prod(
+    inv,
+    prod,
+    col_product_id="product_id"
+):
+    """
+    Completa la categoría en inv desde prod usando product_id,
+    imputa cantidad_stock por mediana por categoria,
+    e imputa valor_inventario_costo cuando esté vacío.
+    """
+
+    inv = inv.copy()
+    prod = prod.copy()
+
+    # ---------------------------------
+    # 1. Diccionario product_id → categoria
+    # ---------------------------------
+    mapa_categoria = (
+        prod[[col_product_id, "categoria"]]
+        .dropna(subset=[col_product_id, "categoria"])
+        .drop_duplicates(col_product_id)
+        .set_index(col_product_id)["categoria"]
+        .to_dict()
+    )
+
+    # ---------------------------------
+    # 2. Completar categoria en inv
+    # ---------------------------------
+    mask = inv["categoria"].isna() & inv[col_product_id].notna()
+
+    inv.loc[mask, "categoria"] = (
+        inv.loc[mask, col_product_id].map(mapa_categoria)
+    )
+
+    # ---------------------------------
+    # 3. Imputar cantidad_stock por mediana de categoria
+    # ---------------------------------
+    mediana_stock = (
+        inv.groupby("categoria")["cantidad_stock"]
+        .median()
+        .round()
+        .astype("Int64")
+    )
+
+    mask = inv["cantidad_stock"].isna() & inv["categoria"].notna()
+
+    inv.loc[mask, "cantidad_stock"] = (
+        inv.loc[mask, "categoria"].map(mediana_stock)
+    )
+
+    # ---------------------------------
+    # 4. Imputar valor_inventario_costo
+    #    = cantidad_stock * costo_unitario (desde prod)
+    # ---------------------------------
+    mapa_costo = (
+        prod[[col_product_id, "costo_unitario"]]
+        .dropna(subset=[col_product_id, "costo_unitario"])
+        .drop_duplicates(col_product_id)
+        .set_index(col_product_id)["costo_unitario"]
+        .to_dict()
+    )
+
+    mask = (
+        inv["valor_inventario_costo"].isna()
+        & inv["cantidad_stock"].notna()
+        & inv[col_product_id].notna()
+    )
+
+    inv.loc[mask, "valor_inventario_costo"] = (
+        inv.loc[mask, "cantidad_stock"]
+        * inv.loc[mask, col_product_id].map(mapa_costo)
+    )
+
+    return inv
+#_________________________________________________________________________
+
+##### Corregir y normalizar tablas #####
+
+# normalizar tabla inv
+inv = limpiar_fecha(inv, "fecha")
+inv = normalizar_categoria(inv, "categoria")
+inv = match_categoria_con_reales(inv, "categoria", categorias_reales, threshold=40)
+inv = limpiar_col_num(inv, "cantidad_stock")
+inv = limpiar_col_num(inv, "valor_inventario_costo")
+
+# normalizar tabla trx
+trx = limpiar_fecha(trx, "fecha")
+trx = normalizar_categoria(trx, "categoria")
+trx = match_categoria_con_reales(trx, "categoria", categorias_reales, threshold=40)
+trx = limpiar_col_num(trx, "unidades_vendidas")
+trx = limpiar_col_num(trx, "precio_unitario_venta")
+trx = limpiar_col_num(trx, "precio_lista_original")
+trx = limpiar_col_num(trx, "monto_descuento_unitario")
+trx = limpiar_col_num(trx, "costo_unitario")
+
+#normalizar tabla prod
+prod = normalizar_categoria(prod, "categoria")
+prod = match_categoria_con_reales(prod, "categoria", categorias_reales, threshold=40)
+prod = limpiar_col_num(prod, "costo_unitario")
+prod = limpiar_col_num(prod, "precio_lista")
+
+#_________________________________________________________________________
+
+##### Imputar valores a tablas para cálculos #####
+
+# Completar tabla maestra de productos
+prod = construir_prod_completo(prod, inv, trx)
+
+# Completar tabla de transacciones
+trx = completar_trx_desde_prod(trx, prod)
+
+#Completar tabla de inventario
+inv = completar_inv_desde_prod(inv, prod)
+
+#_________________________________________________________________________
+
+##### Cálculo de GMROI por categoría #####
+
+# =========================
+# 1. Preparar TRX
+# =========================
+
+trx_gmroi = trx.copy()
+
+# Eliminar filas con información incompleta para el cálculo
+trx_gmroi = trx_gmroi.dropna(
+    subset=[
+        "categoria",
+        "unidades_vendidas",
+        "precio_unitario_venta",
+        "costo_unitario"
+    ]
+)
+
+# Ventas
+trx_gmroi["ventas"] = (
+    trx_gmroi["unidades_vendidas"] * trx_gmroi["precio_unitario_venta"]
+)
+
+# Costo de ventas
+trx_gmroi["costo_ventas"] = (
+    trx_gmroi["unidades_vendidas"] * trx_gmroi["costo_unitario"]
+)
+
+# Margen bruto
+trx_gmroi["margen_bruto"] = (
+    trx_gmroi["ventas"] - trx_gmroi["costo_ventas"]
+)
+
+# Margen bruto por categoría
+margen_por_categoria = (
+    trx_gmroi
+    .groupby("categoria", as_index=False)["margen_bruto"]
+    .sum()
+)
+
+# =========================
+# 2. Preparar INV
+# =========================
+
+inv_gmroi = inv.copy()
+
+# Eliminar filas sin categoría o sin valor de inventario
+inv_gmroi = inv_gmroi.dropna(
+    subset=[
+        "categoria",
+        "valor_inventario_costo"
+    ]
+)
+
+# Inventario promedio a costo por categoría
+inventario_promedio = (
+    inv_gmroi
+    .groupby("categoria", as_index=False)["valor_inventario_costo"]
+    .mean()
+    .rename(columns={
+        "valor_inventario_costo": "inventario_promedio_costo"
+    })
+)
+
+# =========================
+# 3. Calcular GMROI
+# =========================
+
+gmroi_categoria = (
+    margen_por_categoria
+    .merge(inventario_promedio, on="categoria", how="inner")
+)
+
+gmroi_categoria["gmroi"] = (
+    gmroi_categoria["margen_bruto"]
+    / gmroi_categoria["inventario_promedio_costo"]
+)
+
+# Limpiar infinitos (por inventario = 0)
+gmroi_categoria = gmroi_categoria.replace(
+    [np.inf, -np.inf],
+    np.nan
+)
+
+print(gmroi_categoria)
+
+#_________________________________________________________________________
+
+
+##### Cálculo de MARKDOWN por categoría #####
+
+trx_md = trx.copy()
+
+# --- Filtrar filas válidas ---
+trx_md = trx_md.dropna(
+    subset=[
+        "categoria",
+        "unidades_vendidas",
+        "precio_unitario_venta",
+        "monto_descuento_unitario"
+    ]
+)
+
+# Eliminar categorías vacías o solo espacios
+trx_md = trx_md[trx_md["categoria"].str.strip() != ""]
+
+# --- Calcular descuentos ---
+trx_md["descuentos"] = (
+    trx_md["unidades_vendidas"] * trx_md["monto_descuento_unitario"]
+)
+
+# --- Calcular ventas brutas (dinero real) ---
+trx_md["ventas"] = (
+    trx_md["unidades_vendidas"] * trx_md["precio_unitario_venta"]
+)
+
+# --- Eliminar filas con ventas <= 0 ---
+trx_md = trx_md[trx_md["ventas"] > 0]
+
+# --- Agrupar por categoría ---
+markdown_categoria = (
+    trx_md
+    .groupby("categoria", as_index=False)
+    .agg(
+        descuentos_totales=("descuentos", "sum"),
+        ventas_brutas=("ventas", "sum")
+    )
+)
+
+# --- Proteger cálculo final ---
+markdown_categoria = markdown_categoria[
+    markdown_categoria["ventas_brutas"] > 0
+]
+
+# --- Calcular Markdown ---
+markdown_categoria["markdown"] = (
+    markdown_categoria["descuentos_totales"]
+    / markdown_categoria["ventas_brutas"]
+)
+
+# --- Markdown en porcentaje  ---
+markdown_categoria["markdown_pct"] = (
+    markdown_categoria["markdown"] * 100
+)
+
+print(markdown_categoria)

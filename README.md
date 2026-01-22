@@ -38,7 +38,7 @@ Librerias
     pip install -r requirements.txt
 
 Motor del navegador para la automatización (pregunta 2)
-    playwright install chromium
+	python -m playwright install chromium
 ```
 
 ### Ejecución
@@ -163,11 +163,13 @@ Estimación del efecto causal de la publicidad en las ventas.
 
 1. **Pregunta 1:** Se asume que el inventario promedio refleja la inversión típica en stock durante el período analizado.
 
-2. **Pregunta 3:** Se utilizó un split 70/30 para entrenamiento/prueba con estratificación para mantener la proporción de churn.
+2. **Pregunta 2:** La extracion es etica, se aplica respeto por robots.txt y se privilegia la extraccion que tenga menor impacto sobre el servidor.
 
-3. **Pregunta 4:** El modelo Gamma-Gamma requiere que frequency > 0. Los clientes sin compras fueron excluidos del análisis.
+3. **Pregunta 3:** Se utilizó un split 70/30 para entrenamiento/prueba con estratificación para mantener la proporción de churn.
 
-4. **Pregunta 5:** Se asume que los datos contienen el "efecto real" como ground truth para validación de los métodos.
+4. **Pregunta 4:** El modelo Gamma-Gamma requiere que frequency > 0. Los clientes sin compras fueron excluidos del análisis.
+
+5. **Pregunta 5:** Se asume que los datos contienen el "efecto real" como ground truth para validación de los métodos.
 
 ---
 

@@ -1,431 +1,528 @@
-# =============================================================================
-# PREGUNTA 2: WEB SCRAPING - PORTAL INMOBILIARIO
-# Extraccion de datos de casas y departamentos en Huechuraba
-# =============================================================================
-# Este script implementa un scraper para obtener precios y metros cuadrados
-# de propiedades en venta en la comuna de Huechuraba desde Portal Inmobiliario.
-# =============================================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-import numpy as np
-import time
+"""
+Parte 2: Web Scraping (Portal Inmobiliario / Huechuraba)
+
+Requisitos del enunciado (Parte 2):
+- Implementar un scraper para obtener datos de casas y departamentos en Huechuraba desde
+  Portal Inmobiliario (precios y metros cuadrados).
+
+Este script está diseñado para ser:
+1) Ético: respeta robots.txt y aplica throttling; no usa técnicas de evasión.
+2) Reproducible: genera logs, dumps HTML ante bloqueo, y outputs CSV.
+3) Fail-fast: si detecta 401/403/429 o señales de captcha, se detiene y deja evidencia.
+
+Uso (simple):
+    python pregunta_02.py
+
+Uso (configurable):
+    python pregunta_02.py --max-pages 3 --max-items 120 --throttle-min 2 --throttle-max 4 --headless 1
+
+Outputs:
+- data/out/portal_huechuraba_*.csv      (filas extraídas, aunque sean parciales)
+- data/out/metrics_*.csv               (métricas del cuadro 2.1)
+- data/logs/scrape_*.log               (bitácora)
+- data/raw/blocked_*.html              (dumps ante bloqueo/captcha)
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
 import random
 import re
-import warnings
-warnings.filterwarnings('ignore')
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-# -----------------------------------------------------------------------------
-# Configuracion del scraper
-# -----------------------------------------------------------------------------
-print("=" * 70)
-print("PARTE 2: WEB SCRAPING - PORTAL INMOBILIARIO")
-print("=" * 70)
+import numpy as np
+import pandas as pd
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, Response
 
-# Headers para simular un navegador real
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'es-CL,es;q=0.9,en;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-}
 
-# URLs base para Huechuraba
-URL_CASAS = "https://www.portalinmobiliario.com/venta/casa/huechuraba-metropolitana"
-URL_DEPTOS = "https://www.portalinmobiliario.com/venta/departamento/huechuraba-metropolitana"
+# -----------------------------
+# Constantes del sitio objetivo
+# -----------------------------
+BASE = "https://www.portalinmobiliario.com"
+ROBOTS_URL = f"{BASE}/robots.txt"
 
-# -----------------------------------------------------------------------------
-# Funciones de scraping
-# -----------------------------------------------------------------------------
+LISTING_TEMPLATES = [
+    f"{BASE}/venta/{{tipo}}/{{comuna}}-{{region}}",
+]
 
-def extraer_precio_uf(texto_precio):
-    """Extrae el precio en UF de un texto"""
-    if not texto_precio:
+# Regex robustos para UF y m2 (best-effort)
+UF_RE = re.compile(r"\bUF\s*([\d\.\,]+)", re.IGNORECASE)
+M2_RE = re.compile(r"(\d+(?:[\,\.]\d+)?)\s*m2\b", re.IGNORECASE)
+
+USER_AGENT_GROUP = "*"  # para evaluación de robots
+
+# -----------------------------
+# Configuración de ejecución
+# -----------------------------
+@dataclass
+class ScrapeConfig:
+    comuna: str
+    region: str
+    max_pages: int
+    max_items_per_type: int
+    throttle_min_s: float
+    throttle_max_s: float
+    headless: bool
+    timeout_ms: int
+    debug_dump: bool
+
+# -----------------------------
+# Robots.txt (parser simple)
+# -----------------------------
+class RobotsRules:
+    """
+    Parser simple de robots.txt:
+    - Soporta grupos User-agent
+    - Soporta Allow / Disallow
+    - Aplica "longest match" (aprox estándar de facto)
+    """
+
+    def __init__(self, raw: str):
+        self.raw = raw
+        # rules[ua] = list of (action, path_prefix)
+        self.rules: Dict[str, List[Tuple[str, str]]] = {}
+        self._parse()
+
+    def _parse(self) -> None:
+        current_agents: List[str] = []
+        for line in self.raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # elimina comentarios inline
+            if "#" in line:
+                line = line.split("#", 1)[0].strip()
+
+            if ":" not in line:
+                continue
+
+            key, val = [x.strip() for x in line.split(":", 1)]
+            key_lower = key.lower()
+
+            if key_lower == "user-agent":
+                ua = val
+                current_agents = [ua]
+                self.rules.setdefault(ua, [])
+            elif key_lower in ("allow", "disallow"):
+                path = val or "/"
+                for ua in current_agents or [USER_AGENT_GROUP]:
+                    self.rules.setdefault(ua, []).append((key_lower, path))
+
+    def can_fetch(self, path: str, user_agent: str = USER_AGENT_GROUP) -> bool:
+        """
+        Retorna True si path es permitido según robots.txt (mejor-esfuerzo).
+        """
+        if not path.startswith("/"):
+            path = "/" + path
+
+        candidates: List[Tuple[str, str]] = []
+        if user_agent in self.rules:
+            candidates.extend(self.rules[user_agent])
+        if USER_AGENT_GROUP in self.rules and user_agent != USER_AGENT_GROUP:
+            candidates.extend(self.rules[USER_AGENT_GROUP])
+
+        # Sin reglas -> permitido
+        if not candidates:
+            return True
+
+        # Longest-prefix match
+        best_len = -1
+        best_action = "allow"
+        for action, rule_path in candidates:
+            if rule_path and path.startswith(rule_path):
+                if len(rule_path) > best_len:
+                    best_len = len(rule_path)
+                    best_action = action
+
+        return best_action != "disallow"
+
+# -----------------------------
+# Utilidades de I/O y logging
+# -----------------------------
+def ensure_dirs(root: Path) -> Dict[str, Path]:
+    data = root / "data"
+    raw = data / "raw"
+    out = data / "out"
+    logs = data / "logs"
+    raw.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    return {"data": data, "raw": raw, "out": out, "logs": logs}
+
+def now_stamp() -> str:
+    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def log_line(log_path: Path, msg: str) -> None:
+    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+def polite_sleep(cfg: ScrapeConfig) -> None:
+    # Throttling (mínimo impacto). No concurrencia.
+    time.sleep(random.uniform(cfg.throttle_min_s, cfg.throttle_max_s))
+
+def fetch_robots(log_path: Path, timeout_s: int = 20) -> RobotsRules:
+    """
+    Descarga robots.txt (usando urllib estándar) y retorna reglas parseadas.
+    """
+    import urllib.request
+
+    log_line(log_path, f"Descargando robots.txt: {ROBOTS_URL}")
+    req = urllib.request.Request(ROBOTS_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    log_line(log_path, "robots.txt descargado OK.")
+    return RobotsRules(raw)
+
+def build_listing_urls(tipo: str, comuna: str, region: str, page: int) -> List[str]:
+    """
+    Construye URLs de listado:
+    - Page 1: base
+    - Page > 1: intenta paginación tipo "_Desde_" (frecuentemente permitida en robots.txt)
+    Nota: el offset real puede variar; sirve como intento y se documenta en logs.
+    """
+    base_url = LISTING_TEMPLATES[0].format(tipo=tipo, comuna=comuna, region=region)
+    if page <= 1:
+        return [base_url]
+
+    # Offset aproximado, típico de 48 items por página (best-effort)
+    offset = 48 * (page - 1) + 1
+    return [f"{base_url}_Desde_{offset}"]
+
+def save_dump(raw_dir: Path, prefix: str, url: str, status: Optional[int], html: str) -> Path:
+    stamp = now_stamp()
+    safe = re.sub(r"[^a-zA-Z0-9_\-]+", "_", prefix)[:80]
+    fname = f"{safe}_{stamp}_status{status or 'NA'}.html"
+    p = raw_dir / fname
+    with p.open("w", encoding="utf-8") as f:
+        f.write(f"<!-- URL: {url} -->\n")
+        f.write(html)
+    return p
+
+def response_status(resp: Optional[Response]) -> Optional[int]:
+    try:
+        return resp.status if resp is not None else None
+    except Exception:
         return None
-    # Buscar patron de UF (ej: "4.500 UF" o "4500 UF")
-    match = re.search(r'([\d.,]+)\s*UF', texto_precio, re.IGNORECASE)
-    if match:
-        precio_str = match.group(1).replace('.', '').replace(',', '.')
+
+def fetch_page_html(page, url: str, cfg: ScrapeConfig, log_path: Path) -> Tuple[Optional[int], str]:
+    """
+    Navega a la URL con Playwright y devuelve (status_code, html).
+    """
+    log_line(log_path, f"GET {url}")
+    resp = page.goto(url, wait_until="domcontentloaded", timeout=cfg.timeout_ms)
+    status = response_status(resp)
+
+    # Espera breve adicional para contenido base (sin insistencia)
+    page.wait_for_timeout(800)
+    html = page.content()
+    log_line(log_path, f"Status={status} len(html)={len(html)}")
+    return status, html
+
+# -----------------------------
+# Parsing (best-effort)
+# -----------------------------
+def parse_items_from_jsonld(soup: BeautifulSoup) -> List[dict]:
+    """
+    Intenta extraer estructuras JSON-LD (si existen).
+    Si el sitio entrega ItemList, puede haber itemListElement.
+    """
+    items: List[dict] = []
+    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        text = (s.string or "").strip()
+        if not text:
+            continue
         try:
-            return float(precio_str)
-        except:
-            return None
-    return None
+            data = json.loads(text)
+        except Exception:
+            continue
 
-def extraer_metros(texto_metros):
-    """Extrae los metros cuadrados de un texto"""
-    if not texto_metros:
-        return None
-    # Buscar patron de m2 (ej: "120 m²" o "120m2")
-    match = re.search(r'([\d.,]+)\s*m', texto_metros, re.IGNORECASE)
-    if match:
-        metros_str = match.group(1).replace('.', '').replace(',', '.')
+        candidates = data if isinstance(data, list) else [data]
+        for obj in candidates:
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("@type") == "ItemList" and isinstance(obj.get("itemListElement"), list):
+                for el in obj["itemListElement"]:
+                    if isinstance(el, dict):
+                        items.append(el)
+    return items
+
+def extract_price_uf_and_m2_from_text(text: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Extrae UF y m2 desde texto libre (JSON o DOM).
+    Normaliza formatos 1.234,56 o 1,234.56 a float (best-effort).
+    """
+    uf_val = None
+    m = UF_RE.search(text)
+    if m:
+        num = m.group(1).replace(".", "").replace(",", ".")
         try:
-            return float(metros_str)
-        except:
-            return None
-    return None
+            uf_val = float(num)
+        except Exception:
+            uf_val = None
 
-def scrape_pagina(url, max_paginas=5):
-    """Scrapea multiples paginas de resultados"""
-    propiedades = []
-    
-    for pagina in range(1, max_paginas + 1):
+    m2_val = None
+    mm = M2_RE.search(text)
+    if mm:
+        num = mm.group(1).replace(",", ".")
         try:
-            # Construir URL con paginacion
-            url_pagina = f"{url}_Desde_{(pagina-1)*48+1}" if pagina > 1 else url
-            
-            print(f"   Scrapeando pagina {pagina}...")
-            
-            # Realizar request con delay para ser respetuosos
-            time.sleep(random.uniform(1, 3))
-            response = requests.get(url_pagina, headers=HEADERS, timeout=30)
-            
-            if response.status_code != 200:
-                print(f"   [AVISO] Pagina {pagina}: Status {response.status_code}")
-                break
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Buscar contenedores de propiedades
-            # Portal Inmobiliario usa diferentes clases segun la version
-            items = soup.find_all('li', class_=re.compile(r'ui-search-layout__item'))
-            
-            if not items:
-                # Intentar con otra estructura
-                items = soup.find_all('div', class_=re.compile(r'ui-search-result'))
-            
-            if not items:
-                print(f"   [INFO] No se encontraron mas propiedades en pagina {pagina}")
-                break
-            
-            for item in items:
-                try:
-                    # Extraer precio
-                    precio_elem = item.find('span', class_=re.compile(r'price-tag-fraction|andes-money-amount'))
-                    precio_texto = precio_elem.get_text() if precio_elem else ""
-                    
-                    # Buscar si es UF
-                    currency = item.find('span', class_=re.compile(r'price-tag-symbol|andes-money-amount__currency'))
-                    if currency and 'UF' in currency.get_text():
-                        precio_uf = extraer_precio_uf(precio_texto + " UF")
-                    else:
-                        # Intentar extraer de otro lugar
-                        precio_full = item.find('span', class_=re.compile(r'andes-money-amount'))
-                        if precio_full:
-                            precio_uf = extraer_precio_uf(precio_full.get_text())
-                        else:
-                            precio_uf = None
-                    
-                    # Extraer metros cuadrados
-                    attrs = item.find_all('li', class_=re.compile(r'ui-search-card-attributes'))
-                    metros = None
-                    for attr in attrs:
-                        texto = attr.get_text()
-                        if 'm' in texto.lower():
-                            metros = extraer_metros(texto)
-                            if metros:
-                                break
-                    
-                    if precio_uf and metros:
-                        propiedades.append({
-                            'precio_uf': precio_uf,
-                            'metros_cuadrados': metros
-                        })
-                
-                except Exception as e:
-                    continue
-            
-            print(f"   Pagina {pagina}: {len(items)} items encontrados")
-            
-        except requests.exceptions.RequestException as e:
-            print(f"   [ERROR] Error de conexion en pagina {pagina}: {e}")
-            break
-        except Exception as e:
-            print(f"   [ERROR] Error procesando pagina {pagina}: {e}")
-            break
-    
-    return propiedades
+            m2_val = float(num)
+        except Exception:
+            m2_val = None
 
-# -----------------------------------------------------------------------------
-# PREGUNTA 2.1: Scraping y calculo de metricas
-# -----------------------------------------------------------------------------
-print("\n" + "=" * 70)
-print("PREGUNTA 2.1: SCRAPING DE DATOS")
-print("=" * 70)
+    return uf_val, m2_val
 
-print("\n[INFO] NOTA IMPORTANTE:")
-print("-" * 70)
-print("""
-   El web scraping de sitios como Portal Inmobiliario puede fallar debido a:
-   - Cambios en la estructura HTML del sitio
-   - Protecciones anti-bot (CAPTCHA, rate limiting)
-   - Bloqueo de IPs
-   - Contenido cargado dinamicamente con JavaScript
-   
-   Este script intenta extraer datos reales, pero si falla, se mostraran
-   datos de ejemplo para demostrar el analisis.
-""")
+def parse_listings(html: str, tipo: str, url: str) -> List[dict]:
+    """
+    Parser robusto (best-effort):
+    1) Prefiere JSON-LD.
+    2) Fallback: inspecciona texto del DOM en bloques grandes buscando UF y m2.
 
-# Intentar scraping real
-print("\n[PROCESO] Iniciando scraping de CASAS en Huechuraba...")
-casas = scrape_pagina(URL_CASAS, max_paginas=3)
+    Retorna filas con columnas:
+    - tipo: casa|departamento
+    - source_url: listado fuente
+    - price_uf: float o NaN
+    - m2: float o NaN
+    - raw_hint: snippet textual (solo para debug)
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    rows: List[dict] = []
 
-print("\n[PROCESO] Iniciando scraping de DEPARTAMENTOS en Huechuraba...")
-deptos = scrape_pagina(URL_DEPTOS, max_paginas=3)
+    # 1) JSON-LD
+    jsonld_items = parse_items_from_jsonld(soup)
+    if jsonld_items:
+        for it in jsonld_items:
+            blob = json.dumps(it, ensure_ascii=False)
+            uf, m2 = extract_price_uf_and_m2_from_text(blob)
+            rows.append(
+                {
+                    "tipo": tipo,
+                    "source_url": url,
+                    "price_uf": uf,
+                    "m2": m2,
+                    "raw_hint": None,
+                }
+            )
 
-# Si el scraping no obtuvo resultados, usar datos de ejemplo
-if len(casas) < 5 or len(deptos) < 5:
-    print("\n[INFO] Scraping limitado. Usando datos de ejemplo para demostracion...")
-    
-    # Datos de ejemplo basados en precios tipicos de Huechuraba (2024-2025)
-    np.random.seed(42)
-    
-    # Casas: tipicamente entre 4,000 y 15,000 UF, 80-250 m2
-    casas = [
-        {'precio_uf': np.random.uniform(4000, 15000), 
-         'metros_cuadrados': np.random.uniform(80, 250)}
-        for _ in range(25)
-    ]
-    
-    # Departamentos: tipicamente entre 2,000 y 6,000 UF, 40-120 m2
-    deptos = [
-        {'precio_uf': np.random.uniform(2000, 6000), 
-         'metros_cuadrados': np.random.uniform(40, 120)}
-        for _ in range(35)
-    ]
+    # 2) Fallback DOM (sin depender de clases CSS específicas)
+    if not rows:
+        candidates = soup.find_all(["article", "li", "div"], limit=700)
+        for c in candidates:
+            text = c.get_text(" ", strip=True)
+            if "UF" not in text:
+                continue
+            uf, m2 = extract_price_uf_and_m2_from_text(text)
+            if uf is None and m2 is None:
+                continue
+            rows.append(
+                {
+                    "tipo": tipo,
+                    "source_url": url,
+                    "price_uf": uf,
+                    "m2": m2,
+                    "raw_hint": text[:250],
+                }
+            )
 
-# Convertir a DataFrames
-df_casas = pd.DataFrame(casas)
-df_deptos = pd.DataFrame(deptos)
+    # Deduplicación simple
+    uniq: List[dict] = []
+    seen = set()
+    for r in rows:
+        key = (r["tipo"], r.get("price_uf"), r.get("m2"), r["source_url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(r)
 
-# Calcular metricas
-print("\n" + "=" * 70)
-print("RESULTADOS DEL SCRAPING")
-print("=" * 70)
+    return uniq
 
-# Numero de propiedades
-n_casas = len(df_casas)
-n_deptos = len(df_deptos)
+# -----------------------------
+# Métricas (cuadro 2.1)
+# -----------------------------
+def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Retorna un DataFrame con el cuadro del enunciado (best-effort):
+    - Conteo por tipo
+    - Mediana UF por tipo
+    - Promedio UF por tipo
+    - Promedio UF/m2 por tipo (con filas válidas UF y m2)
+    """
+    def safe_median(s: pd.Series) -> float:
+        s2 = s.dropna()
+        return float(s2.median()) if len(s2) else float("nan")
 
-# Medianas
-mediana_casas = df_casas['precio_uf'].median()
-mediana_deptos = df_deptos['precio_uf'].median()
+    def safe_mean(s: pd.Series) -> float:
+        s2 = s.dropna()
+        return float(s2.mean()) if len(s2) else float("nan")
 
-# Promedios
-promedio_casas = df_casas['precio_uf'].mean()
-promedio_deptos = df_deptos['precio_uf'].mean()
+    metrics = []
 
-# Precio por m2
-df_casas['precio_m2'] = df_casas['precio_uf'] / df_casas['metros_cuadrados']
-df_deptos['precio_m2'] = df_deptos['precio_uf'] / df_deptos['metros_cuadrados']
+    for tipo in ["casa", "departamento"]:
+        sub = df[df["tipo"] == tipo].copy()
+        n = int(len(sub))
+        med = safe_median(sub["price_uf"])
+        avg = safe_mean(sub["price_uf"])
 
-precio_m2_casas = df_casas['precio_m2'].mean()
-precio_m2_deptos = df_deptos['precio_m2'].mean()
+        sub_valid = sub.dropna(subset=["price_uf", "m2"])
+        uf_m2 = safe_mean(sub_valid["price_uf"] / sub_valid["m2"]) if len(sub_valid) else float("nan")
 
-# Mostrar tabla de resultados
-print("\n[TABLA] Metricas de Propiedades en Huechuraba:")
-print("-" * 70)
-print(f"{'Metrica':<50} {'Valor':>15}")
-print("-" * 70)
-print(f"{'Numero de casas scrapeadas (#)':<50} {n_casas:>15}")
-print(f"{'Numero de departamentos scrapeados (#)':<50} {n_deptos:>15}")
-print(f"{'Mediana de precio de las casas (UF)':<50} {mediana_casas:>15,.2f}")
-print(f"{'Mediana de precio de los departamentos (UF)':<50} {mediana_deptos:>15,.2f}")
-print(f"{'Promedio de precio de las casas (UF)':<50} {promedio_casas:>15,.2f}")
-print(f"{'Promedio de precio de los departamentos (UF)':<50} {promedio_deptos:>15,.2f}")
-print(f"{'Precio por m2 de casas (UF/m2)':<50} {precio_m2_casas:>15,.2f}")
-print(f"{'Precio por m2 de departamento (UF/m2)':<50} {precio_m2_deptos:>15,.2f}")
-print("-" * 70)
+        if tipo == "casa":
+            metrics.append(("Número de casas scrapeadas (#)", n))
+            metrics.append(("Mediana de precio de las casas (UF)", med))
+            metrics.append(("Promedio de precio de las casas (UF)", avg))
+            metrics.append(("Precio por m2 de casas (UF/m2)", uf_m2))
+        else:
+            metrics.append(("Número de departamentos scrapeados (#)", n))
+            metrics.append(("Mediana de precio de los departamentos (UF)", med))
+            metrics.append(("Promedio de precio de los departamentos (UF)", avg))
+            metrics.append(("Precio por m2 de departamento (UF/m2)", uf_m2))
 
-# Comentarios de resultados
-print("\n[ANALISIS] COMENTARIOS DE LOS RESULTADOS:")
-print("-" * 70)
-print(f"""
-1. VOLUMEN DE DATOS:
-   Se obtuvieron {n_casas} casas y {n_deptos} departamentos en Huechuraba.
-   {'El mercado de departamentos es mas activo que el de casas.' if n_deptos > n_casas else 'El mercado de casas es mas activo que el de departamentos.'}
+    return pd.DataFrame(metrics, columns=["Métrica", "Valor"])
 
-2. COMPARACION DE PRECIOS:
-   - Las casas tienen un precio promedio de {promedio_casas:,.0f} UF
-   - Los departamentos tienen un precio promedio de {promedio_deptos:,.0f} UF
-   - Diferencia: Las casas cuestan {(promedio_casas/promedio_deptos - 1)*100:.1f}% mas que los departamentos
+# -----------------------------
+# Main (CLI)
+# -----------------------------
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Parte 2 Web Scraping (ético, fail-fast) — Portal Inmobiliario Huechuraba"
+    )
+    # Defaults:"python pregunta_02.py"
+    parser.add_argument("--comuna", default="huechuraba", help="slug comuna (default: huechuraba)")
+    parser.add_argument("--region", default="metropolitana", help="slug región (default: metropolitana)")
+    parser.add_argument("--max-pages", type=int, default=3, help="máximo páginas por tipo (default: 3)")
+    parser.add_argument("--max-items", type=int, default=150, help="máximo items por tipo (default: 150)")
+    parser.add_argument("--throttle-min", type=float, default=2.0, help="sleep mínimo entre requests (s)")
+    parser.add_argument("--throttle-max", type=float, default=4.0, help="sleep máximo entre requests (s)")
+    parser.add_argument("--headless", type=int, default=1, help="1=headless, 0=con ventana (debug)")
+    parser.add_argument("--timeout-ms", type=int, default=25000, help="timeout navegación playwright (ms)")
+    parser.add_argument("--debug-dump", type=int, default=1, help="1=guardar dumps HTML ante bloqueo/falla")
+    args = parser.parse_args()
 
-3. ANALISIS DE MEDIANA VS PROMEDIO:
-   - Casas: Mediana {mediana_casas:,.0f} UF vs Promedio {promedio_casas:,.0f} UF
-   - Deptos: Mediana {mediana_deptos:,.0f} UF vs Promedio {promedio_deptos:,.0f} UF
-   {'La diferencia sugiere presencia de propiedades de alto valor que sesgan el promedio.' if promedio_casas > mediana_casas * 1.1 else 'Los precios tienen una distribucion relativamente simetrica.'}
+    cfg = ScrapeConfig(
+        comuna=args.comuna,
+        region=args.region,
+        max_pages=args.max_pages,
+        max_items_per_type=args.max_items,
+        throttle_min_s=args.throttle_min,
+        throttle_max_s=args.throttle_max,
+        headless=bool(args.headless),
+        timeout_ms=args.timeout_ms,
+        debug_dump=bool(args.debug_dump),
+    )
 
-4. PRECIO POR METRO CUADRADO:
-   - Casas: {precio_m2_casas:.2f} UF/m2
-   - Deptos: {precio_m2_deptos:.2f} UF/m2
-   {'Los departamentos tienen mayor precio por m2, tipico de propiedades mas pequenas.' if precio_m2_deptos > precio_m2_casas else 'Las casas tienen mayor precio por m2, posiblemente por terrenos mas amplios.'}
-""")
+    root = Path.cwd()
+    paths = ensure_dirs(root)
+    stamp = now_stamp()
+    log_path = paths["logs"] / f"scrape_{stamp}.log"
 
-# -----------------------------------------------------------------------------
-# PREGUNTA 2.2: Desafios eticos y tecnicos
-# -----------------------------------------------------------------------------
-print("\n" + "=" * 70)
-print("PREGUNTA 2.2: DESAFIOS ETICOS Y TECNICOS DEL WEB SCRAPING")
-print("=" * 70)
+    log_line(log_path, "Iniciando scraping (ético, fail-fast).")
+    log_line(log_path, f"Config: {cfg}")
+    log_line(log_path, "Nota: Si hay 403/captcha, el script se detiene y guarda evidencia en data/raw/.")
 
-print("""
-[ANALISIS] DESAFIOS ETICOS
-----------------------------------------------------------------------
+    # 1) robots.txt (se usa para decidir si visitar o no ciertas rutas)
+    robots = fetch_robots(log_path)
 
-1. TERMINOS DE SERVICIO
-   - Muchos sitios web prohiben explicitamente el scraping en sus ToS
-   - Portal Inmobiliario puede tener restricciones legales sobre el uso de datos
-   - Es necesario revisar robots.txt y los terminos antes de scrapear
+    all_rows: List[dict] = []
 
-2. PRIVACIDAD DE DATOS
-   - Los listados pueden contener informacion de contacto de vendedores
-   - Datos personales estan protegidos por leyes como la Ley 19.628 en Chile
-   - Se debe anonimizar o evitar capturar datos sensibles
+    # 2) Playwright: un solo navegador, una sola pestaña, sin paralelismo
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=cfg.headless)
+        context = browser.new_context()
+        page = context.new_page()
 
-3. IMPACTO EN EL SERVICIO
-   - Scraping agresivo puede sobrecargar los servidores del sitio
-   - Puede afectar la experiencia de otros usuarios
-   - Es importante ser "buen ciudadano" de internet
+        # Orden solicitado por el usuario: primero deptos, luego casas
+        for tipo in ["departamento", "casa"]:
+            log_line(log_path, f"[{tipo}] Iniciando...")
 
-4. USO COMERCIAL VS ACADEMICO
-   - El uso academico puede tener consideraciones diferentes
-   - El uso comercial de datos scrapeados puede violar derechos de autor
-   - La base de datos compilada puede estar protegida legalmente
+            blocked = False
+            collected_for_type = 0
 
-----------------------------------------------------------------------
-[ANALISIS] DESAFIOS TECNICOS
-----------------------------------------------------------------------
+            for page_i in range(1, cfg.max_pages + 1):
+                candidate_urls = build_listing_urls(tipo, cfg.comuna, cfg.region, page_i)
 
-1. CONTENIDO DINAMICO (JAVASCRIPT)
-   - Muchos sitios modernos cargan contenido via JavaScript/AJAX
-   - BeautifulSoup solo ve el HTML inicial
-   - Solucion: Usar Selenium, Playwright o APIs si estan disponibles
+                for url in candidate_urls:
+                    # Respeto robots.txt (si el path está desautorizado, se salta)
+                    path = url.replace(BASE, "", 1)
+                    if not robots.can_fetch(path, USER_AGENT_GROUP):
+                        log_line(log_path, f"[{tipo}] SKIP por robots.txt: {path}")
+                        continue
 
-2. PROTECCIONES ANTI-BOT
-   - CAPTCHAs que bloquean accesos automatizados
-   - Rate limiting que bloquea IPs con muchas solicitudes
-   - Fingerprinting de navegadores
-   - Solucion: Rotacion de IPs, delays aleatorios, headers realistas
+                    polite_sleep(cfg)
 
-3. CAMBIOS EN LA ESTRUCTURA HTML
-   - Los sitios cambian su diseno frecuentemente
-   - Los selectores CSS/XPath dejan de funcionar
-   - Solucion: Monitoreo y mantenimiento continuo del scraper
+                    status, html = fetch_page_html(page, url, cfg, log_path)
 
-4. PAGINACION Y SCROLL INFINITO
-   - Los resultados pueden estar distribuidos en multiples paginas
-   - Algunos sitios usan scroll infinito sin URLs claras
-   - Solucion: Simular comportamiento de usuario, identificar patrones
+                    # Detección de bloqueo (WAF/anti-bot)
+                    is_captcha = "captcha" in (html or "").lower()
+                    is_denied = (html and ("Access Denied" in html or "access denied" in html.lower()))
+                    if status in (401, 403, 429) or is_captcha or is_denied:
+                        log_line(log_path, f"[{tipo}] BLOQUEO detectado (status={status}, captcha={is_captcha}). Deteniendo tipo.")
+                        if cfg.debug_dump:
+                            dump_path = save_dump(paths["raw"], f"blocked_{tipo}_p{page_i}", url, status, html)
+                            log_line(log_path, f"[{tipo}] Dump guardado: {dump_path}")
+                        blocked = True
+                        break
 
-5. MANEJO DE ERRORES Y REINTENTOS
-   - Conexiones fallidas, timeouts, respuestas incompletas
-   - Datos faltantes o mal formateados
-   - Solucion: Implementar retry logic, validacion robusta
+                    # Parseo de listados
+                    rows = parse_listings(html, tipo, url)
+                    log_line(log_path, f"[{tipo}] items parseados en página: {len(rows)}")
+                    all_rows.extend(rows)
 
-----------------------------------------------------------------------
-[RECOMENDACIONES] MEDIDAS PARA EXTRACCION ETICA Y PERSISTENTE
-----------------------------------------------------------------------
+                    # Límite por tipo
+                    collected_for_type = sum(1 for r in all_rows if r["tipo"] == tipo)
+                    if collected_for_type >= cfg.max_items_per_type:
+                        log_line(log_path, f"[{tipo}] alcanzado max_items_per_type={cfg.max_items_per_type}.")
+                        break
 
-1. RESPETAR ROBOTS.TXT
-   * Revisar y cumplir las directivas del archivo robots.txt
-   * No acceder a rutas prohibidas
+                if blocked or collected_for_type >= cfg.max_items_per_type:
+                    break
 
-2. IMPLEMENTAR RATE LIMITING
-   * Usar delays entre requests (1-5 segundos minimo)
-   * Randomizar tiempos para parecer trafico humano
-   * Limitar el numero de requests por hora/dia
+            log_line(log_path, f"[{tipo}] Finalizado. Total tipo={collected_for_type} blocked={blocked}")
 
-3. USAR HEADERS APROPIADOS
-   * Incluir User-Agent que identifique el proposito
-   * Simular un navegador real pero ser transparente si es necesario
+        context.close()
+        browser.close()
 
-4. CACHE Y ALMACENAMIENTO LOCAL
-   * Guardar datos ya obtenidos para no re-scrapear
-   * Implementar cache con expiracion razonable
+    # 3) Guardar dataset extraído (aunque sea parcial)
+    df = pd.DataFrame(all_rows)
+    out_csv = paths["out"] / f"portal_huechuraba_{stamp}.csv"
+    df.to_csv(out_csv, index=False, encoding="utf-8")
 
-5. MANEJO ROBUSTO DE ERRORES
-   * Implementar reintentos con backoff exponencial
-   * Logging detallado para debugging
-   * Alertas cuando el scraper falla
+    log_line(log_path, f"CSV guardado: {out_csv} (rows={len(df)})")
 
-6. VALIDACION DE DATOS
-   * Verificar integridad de los datos extraidos
-   * Detectar anomalias que pueden indicar bloqueos
-   * Comparar con fuentes alternativas si es posible
+    # 4) Si no hubo filas, igual dejamos evidencia en logs para el informe
+    if len(df) == 0:
+        log_line(log_path, "No se obtuvieron filas. Revisa logs/dumps para justificar bloqueo en el informe.")
+        log_line(log_path, f"LOG: {log_path}")
+        return 2
 
-7. DOCUMENTACION Y TRAZABILIDAD
-   * Registrar cuando y como se obtuvieron los datos
-   * Mantener metadata sobre la fuente
-   * Version control del codigo del scraper
+    # 5) Limpieza/normalización numérica
+    df["price_uf"] = pd.to_numeric(df.get("price_uf"), errors="coerce")
+    df["m2"] = pd.to_numeric(df.get("m2"), errors="coerce")
 
-8. ALTERNATIVAS AL SCRAPING
-   * Buscar APIs oficiales del sitio
-   * Considerar acuerdos de licenciamiento de datos
-   * Usar datasets publicos existentes si estan disponibles
+    # 6) Métricas 2.1
+    metrics = compute_metrics(df)
+    metrics_csv = paths["out"] / f"metrics_{stamp}.csv"
+    metrics.to_csv(metrics_csv, index=False, encoding="utf-8")
 
-----------------------------------------------------------------------
-CODIGO DE EJEMPLO PARA PRODUCCION:
-----------------------------------------------------------------------
+    log_line(log_path, f"Métricas guardadas: {metrics_csv}")
+    log_line(log_path, "Resumen métricas (tabla):")
+    for _, row in metrics.iterrows():
+        log_line(log_path, f" - {row['Métrica']}: {row['Valor']}")
+    log_line(log_path, f"LOG: {log_path}")
+    log_line(log_path, "Proceso finalizado.")
+    return 0
 
-# Ejemplo de configuracion robusta para produccion:
-
-# import requests
-# from requests.adapters import HTTPAdapter
-# from urllib3.util.retry import Retry
-
-# def crear_session_robusta():
-#     session = requests.Session()
-#     retry = Retry(
-#         total=3,
-#         backoff_factor=1,
-#         status_forcelist=[429, 500, 502, 503, 504]
-#     )
-#     adapter = HTTPAdapter(max_retries=retry)
-#     session.mount('http://', adapter)
-#     session.mount('https://', adapter)
-#     return session
-
-# def scrape_con_respeto(url, session, min_delay=2, max_delay=5):
-#     time.sleep(random.uniform(min_delay, max_delay))
-#     response = session.get(url, headers=HEADERS, timeout=30)
-#     return response
-
-----------------------------------------------------------------------
-""")
-
-# Guardar resultados en CSV
-print("\n[INFO] Guardando resultados en data/resultados_scraping.csv...")
-try:
-    resultados = pd.DataFrame({
-        'Metrica': [
-            'Numero de casas scrapeadas (#)',
-            'Numero de departamentos scrapeados (#)',
-            'Mediana de precio de las casas (UF)',
-            'Mediana de precio de los departamentos (UF)',
-            'Promedio de precio de las casas (UF)',
-            'Promedio de precio de los departamentos (UF)',
-            'Precio por m2 de casas (UF/m2)',
-            'Precio por m2 de departamento (UF/m2)'
-        ],
-        'Valor': [
-            n_casas,
-            n_deptos,
-            round(mediana_casas, 2),
-            round(mediana_deptos, 2),
-            round(promedio_casas, 2),
-            round(promedio_deptos, 2),
-            round(precio_m2_casas, 2),
-            round(precio_m2_deptos, 2)
-        ]
-    })
-    resultados.to_csv('data/resultados_scraping.csv', index=False)
-    print("   Archivo guardado exitosamente.")
-except Exception as e:
-    print(f"   [AVISO] No se pudo guardar el archivo: {e}")
-
-print("\n" + "=" * 70)
-print("[OK] Analisis de Web Scraping completado")
-print("=" * 70)
+if __name__ == "__main__":
+    raise SystemExit(main())
